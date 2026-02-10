@@ -1,0 +1,109 @@
+{
+  "global": {
+    "counting_lines": [
+      {
+        "line_y": 227,
+        "direction": "both"
+      }
+    ],
+    "forbidden_zones": [
+      [
+        [
+          203,
+          169
+        ],
+        [
+          164,
+          210
+        ],
+        [
+          524,
+          216
+        ],
+        [
+          515,
+          170
+        ],
+        [
+          205,
+          171
+        ]
+      ]
+    ],
+    "parking_zones": [
+      [
+        [
+          76,
+          246
+        ],
+        [
+          4,
+          353
+        ],
+        [
+          730,
+          406
+        ],
+        [
+          661,
+          236
+        ],
+        [
+          75,
+          245
+        ]
+      ]
+    ],
+    "loitering_zones": [],
+    "restricted_areas": []
+  },
+  "cameras": {
+    "C:/itlocal/examin_finale_ia/video5.mp4": {
+      "counting_lines": [
+        {
+          "line_y": 231,
+          "direction": "horizontal",
+          "x_start": 589,
+          "x_end": 591
+        },
+        {
+          "line_y": 587,
+          "direction": "vertical",
+          "y_start": 176,
+          "y_end": 230
+        },
+        {
+          "line_y": 271,
+          "direction": "horizontal",
+          "x_start": 457,
+          "x_end": 584
+        }
+      ],
+      "forbidden_zones": [],
+      "parking_zones": [],
+      "loitering_zones": [],
+      "restricted_areas": []
+    },
+    "C:/itlocal/examin_finale_ia/video4.mp4": {
+      "counting_lines": [
+        {
+          "line_y": 557,
+          "direction": "horizontal",
+          "x_start": 943,
+          "x_end": 1200
+        }
+      ],
+      "forbidden_zones": [],
+      "parking_zones": [],
+      "loitering_zones": [],
+      "restricted_areas": []
+    },
+    "http://192.168.1.66:8080": {
+      "counting_lines": [],
+      "forbidden_zones": [],
+      "parking_zones": [],
+      "loitering_zones": [],
+      "restricted_areas": []
+    }
+  }
+}

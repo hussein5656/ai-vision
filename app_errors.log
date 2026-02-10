@@ -1,0 +1,56 @@
+[2026-02-09T21:33:01.517501] Processing error: error: OpenCV(4.12.0) :-1: error: (-5:Bad argument) in function 'polylines'
+> Overload resolution failed:
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+
+Traceback (most recent call last):
+  File "c:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 117, in run
+    vis_frame = self._draw_professional_viz(frame, tracks)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 181, in _draw_professional_viz
+    self._draw_zones(vis, self.zones_config)
+  File "c:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 203, in _draw_zones
+    cv2.polylines(frame, [pts], True, (0, 0, 255), 2)
+cv2.error: OpenCV(4.12.0) :-1: error: (-5:Bad argument) in function 'polylines'
+> Overload resolution failed:
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+
+
+[2026-02-09T21:34:35.650433] Processing error: error: OpenCV(4.12.0) :-1: error: (-5:Bad argument) in function 'polylines'
+> Overload resolution failed:
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+
+Traceback (most recent call last):
+  File "C:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 117, in run
+    vis_frame = self._draw_professional_viz(frame, tracks)
+  File "C:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 181, in _draw_professional_viz
+    self._draw_zones(vis, self.zones_config)
+  File "C:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 203, in _draw_zones
+    cv2.polylines(frame, [pts], True, (0, 0, 255), 2)
+cv2.error: OpenCV(4.12.0) :-1: error: (-5:Bad argument) in function 'polylines'
+> Overload resolution failed:
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+
+
+[2026-02-09T21:38:11.936405] Processing error: error: OpenCV(4.12.0) :-1: error: (-5:Bad argument) in function 'polylines'
+> Overload resolution failed:
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+
+Traceback (most recent call last):
+  File "c:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 117, in run
+    vis_frame = self._draw_professional_viz(frame, tracks)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 181, in _draw_professional_viz
+    self._draw_zones(vis, self.zones_config)
+  File "c:\itlocal\projetfinaleIT\ui\video_thread_professional.py", line 203, in _draw_zones
+    cv2.polylines(frame, [pts], True, (0, 0, 255), 2)
+cv2.error: OpenCV(4.12.0) :-1: error: (-5:Bad argument) in function 'polylines'
+> Overload resolution failed:
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+>  - Can't parse 'pts'. Sequence item with index 0 has a wrong type
+
+
