@@ -2,13 +2,15 @@
 
 import sys
 import os
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QEvent, QSize
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTabWidget, QSpinBox,
                              QMessageBox, QDialog, QTableWidget, QTableWidgetItem,
                              QCheckBox, QGroupBox, QFormLayout, QComboBox,
-                             QSlider, QScrollArea, QLineEdit)
+                             QSlider, QScrollArea, QLineEdit, QSizePolicy,
+                             QGridLayout)
 from PyQt6.QtGui import QPixmap, QFont, QColor
+from dataclasses import dataclass, field
 from typing import Dict, Optional
 from datetime import datetime
 
@@ -18,6 +20,103 @@ from ui.app_dark_advanced import SourceDialog, DARK_STYLESHEET
 from vision.camera import Camera
 from storage.zones_manager import ZonesManager
 from vision.first_frame import get_first_frame
+
+
+class VideoTile(QLabel):
+    """Video surface that scales content to available space and notifies when selected."""
+
+    clicked = pyqtSignal(int)
+
+    def __init__(self, feed_id: int, parent: Optional[QWidget] = None,
+                 preferred_width: int = 320, aspect_ratio: float = 16 / 9):
+        super().__init__(parent)
+        self.feed_id = feed_id
+        self._last_pixmap: Optional[QPixmap] = None
+        self._aspect_ratio = aspect_ratio
+        self._preferred_width = max(160, int(preferred_width))
+        self._preferred_height = max(90, int(self._preferred_width / self._aspect_ratio))
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.resize_tile(self._preferred_width, self._preferred_height)
+        self._apply_style(active=False)
+        self.setText("Flux en attente...\nCliquez pour activer ce panneau")
+
+    def _apply_style(self, active: bool):
+        border = "#00ff00" if active else "#444444"
+        self.setStyleSheet(
+            f"border: 3px solid {border}; border-radius: 8px; background-color: #000000;"
+        )
+
+    def set_active(self, active: bool):
+        self._apply_style(active)
+        if active and self._last_pixmap is None:
+            self.setText("Flux actif en attente...")
+
+    def mousePressEvent(self, event):  # pragma: no cover - UI behavior
+        self.clicked.emit(self.feed_id)
+        super().mousePressEvent(event)
+
+    def update_frame(self, image_bytes: bytes):
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(image_bytes):
+            return
+        self._last_pixmap = pixmap
+        self.setText("")
+        self._apply_scaled_pixmap()
+
+    def resizeEvent(self, event):  # pragma: no cover - UI behavior
+        super().resizeEvent(event)
+        self._apply_scaled_pixmap()
+
+    def _apply_scaled_pixmap(self):
+        if not self._last_pixmap:
+            return
+        size = self.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        scaled = self._last_pixmap.scaled(
+            size, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        self.setPixmap(scaled)
+
+    def resize_tile(self, width: int, height: Optional[int] = None):
+        width = max(100, int(width))
+        if height is None:
+            height = max(60, int(width / self._aspect_ratio))
+        else:
+            height = max(60, int(height))
+        self._preferred_width = width
+        self._preferred_height = height
+        self.updateGeometry()
+        self._apply_scaled_pixmap()
+
+    def sizeHint(self):  # pragma: no cover - size negotiation is UI-specific
+        return QSize(self._preferred_width, self._preferred_height)
+
+    def minimumSizeHint(self):  # pragma: no cover - UI behavior
+        return self.sizeHint()
+
+
+@dataclass
+class FeedContext:
+    feed_id: int
+    source: object
+    source_type: int
+    zone_profile_id: str
+    video_label: VideoTile
+    zones_config: Dict
+    thread: Optional['ProfessionalVideoThread'] = None
+    last_stats: Dict = field(default_factory=dict)
+    last_frame_total: int = 0
+    last_frame_index: int = 0
+    last_source_fps: float = 0.0
+    pending_speed: float = 1.0
+    start_time: Optional[datetime] = None
+
+    @property
+    def is_video_source(self) -> bool:
+        return self.source_type == 2
 
 
 class NoWheelSpinBox(QSpinBox):
@@ -42,7 +141,6 @@ class AlertsWindow(QWidget):
         self.setWindowTitle("Système d'Alertes Professionnel")
         self.setGeometry(100, 100, 1000, 600)
         self.setStyleSheet(DARK_STYLESHEET)
-        self.video_label.setText("En attente du flux vidéo...")  # Message d'attente pour le flux vidéo
         
         layout = QVBoxLayout()
         
@@ -92,7 +190,7 @@ class AlertsWindow(QWidget):
         
         self.setLayout(layout)
     
-    def add_alert(self, alert_type: str, message: str, camera_id: int, track_id: int):
+    def add_alert(self, alert_type: str, message: str, camera_id, track_id: int):
         """Add alert to table."""
         # Filtering: respect filter checkboxes
         typ = alert_type.upper()
@@ -152,17 +250,12 @@ class ProfessionalCameraTab(QWidget):
     def __init__(self, camera_id: int, source, source_type: int):
         super().__init__()
         self.camera_id = camera_id
-        self.source = source
-        self.source_type = source_type
-        self.is_video_source = (self.source_type == 2)
-        self.thread: Optional['ProfessionalVideoThread'] = None
-        self.zone_profile_id = str(self.source)
-        self.zones_config = ZonesManager.load_zones(self.zone_profile_id)
         self.alerts_window = None
+        self.feed_counter = 0
+        self.feeds: Dict[int, FeedContext] = {}
+        self.active_feed_id: Optional[int] = None
         self._slider_active = False
-        self._last_frame_total = 0
-        self._last_source_fps = 0
-        self._last_frame_index = 0
+        self._slider_active_feed_id: Optional[int] = None
         self._pending_speed = 1.0
         self._hidden_classes = set()
         self._info_panel_defaults = {
@@ -173,6 +266,10 @@ class ProfessionalCameraTab(QWidget):
             'parking': True,
             'forbidden': True
         }
+        self._tile_min_width = 160
+        self._tile_max_width = 640
+        self._tile_aspect_ratio = 16 / 9
+        self._max_feeds_per_tab = 5
         # Liste de modèles compatibles proposée à l'utilisateur
         self._available_models = [
             ("YOLOv8n (rapide)", "models/yolov8n.pt"),
@@ -183,25 +280,33 @@ class ProfessionalCameraTab(QWidget):
         ]
         self._model_path = self._available_models[0][1]
         self._setup_ui()
-        self.start_time = None
+        self._create_feed(source, source_type)
     
     def _setup_ui(self):
         """Setup professional UI."""
         layout = QHBoxLayout()
         
-        # Left: Video display
+        # Left: Video grid (supports multiple simultaneous feeds)
         left_layout = QVBoxLayout()
+        left_layout.setSpacing(12)
+
+        self.video_grid_widget = QWidget()
+        self.video_grid_layout = QGridLayout()
+        self.video_grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.video_grid_layout.setSpacing(12)
+        self.video_grid_widget.setLayout(self.video_grid_layout)
+
+        self.video_area = QScrollArea()
+        self.video_area.setWidgetResizable(True)
+        self.video_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.video_area.setWidget(self.video_grid_widget)
+        self.video_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.video_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.video_area.viewport().installEventFilter(self)
+
+        left_layout.addWidget(self.video_area)
         
-        self.video_label = QLabel()
-        self.video_label.setMinimumSize(650, 490)
-        self.video_label.setStyleSheet(
-            "border: 3px solid #00ff00; background-color: #000000; border-radius: 4px;"
-        )
-        self.video_label.setText("En attente du flux vidéo...")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        left_layout.addWidget(self.video_label)
-        
-        layout.addLayout(left_layout, 2)
+        layout.addLayout(left_layout, 3)
         
         # Right: Control panel
         right_layout = QVBoxLayout()
@@ -411,9 +516,9 @@ class ProfessionalCameraTab(QWidget):
         playback_layout.addRow("", self.playback_position_label)
 
         playback_group.setLayout(playback_layout)
-        playback_group.setEnabled(self.is_video_source)
-        if not self.is_video_source:
-            playback_group.setToolTip("Contrôles disponibles uniquement pour les vidéos enregistrées")
+        playback_group.setEnabled(False)
+        playback_group.setToolTip("Sélectionnez un flux vidéo pour activer ces contrôles")
+        self.playback_group = playback_group
         right_layout.addWidget(playback_group)
         
         # Control buttons
@@ -447,6 +552,11 @@ class ProfessionalCameraTab(QWidget):
         self.alerts_btn.setMinimumHeight(40)
         self.alerts_btn.clicked.connect(self.show_alerts)
         btn_layout.addWidget(self.alerts_btn)
+
+        self.add_feed_btn = QPushButton("➕ AJOUTER FLUX DANS L'ONGLET")
+        self.add_feed_btn.setMinimumHeight(36)
+        self.add_feed_btn.clicked.connect(self._add_additional_feed)
+        btn_layout.addWidget(self.add_feed_btn)
         
         right_layout.addLayout(btn_layout)
         right_layout.addStretch()
@@ -465,82 +575,290 @@ class ProfessionalCameraTab(QWidget):
         # Update timer for uptime
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self._update_uptime)
-        if self.is_video_source:
+        self._reset_playback_controls()
+
+    def _create_feed(self, source, source_type):
+        feed_id = self.feed_counter
+        self.feed_counter += 1
+        tile = VideoTile(feed_id, preferred_width=self._tile_max_width, aspect_ratio=self._tile_aspect_ratio)
+        tile.clicked.connect(self._set_active_feed)
+        context = FeedContext(
+            feed_id=feed_id,
+            source=source,
+            source_type=source_type,
+            zone_profile_id=str(source),
+            video_label=tile,
+            zones_config=ZonesManager.load_zones(str(source))
+        )
+        self.feeds[feed_id] = context
+        self._reflow_video_tiles()
+        self._sync_feed_limit_state()
+        if self.active_feed_id is None:
+            self._set_active_feed(feed_id)
+        else:
+            tile.set_active(False)
+            self._update_status_badge()
+
+    def _reflow_video_tiles(self):
+        count = self.video_grid_layout.count()
+        for index in reversed(range(count)):
+            item = self.video_grid_layout.takeAt(index)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
+        feed_items = list(self.feeds.values())
+        if not feed_items:
+            placeholder = QLabel("Ajoutez un flux pour commencer")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            placeholder.setStyleSheet("color: #888; border: 1px dashed #444; padding: 40px;")
+            self.video_grid_layout.addWidget(placeholder, 0, 0)
+            return
+
+        layout_def = self._build_layout_blueprint(len(feed_items))
+        base_width, base_height = self._calculate_tile_hints(layout_def['rows'], layout_def['columns'])
+
+        for row in range(0, 5):
+            self.video_grid_layout.setRowStretch(row, 0)
+        for col in range(0, 5):
+            self.video_grid_layout.setColumnStretch(col, 0)
+
+        for row in range(layout_def['rows']):
+            self.video_grid_layout.setRowStretch(row, 1)
+        for col in range(layout_def['columns']):
+            self.video_grid_layout.setColumnStretch(col, 1)
+
+        for feed, slot in zip(feed_items, layout_def['slots']):
+            row, col, row_span, col_span = slot
+            pref_width = base_width * col_span
+            pref_height = base_height * row_span
+            feed.video_label.resize_tile(pref_width, pref_height)
+            self.video_grid_layout.addWidget(feed.video_label, row, col, row_span, col_span)
+
+    def _build_layout_blueprint(self, feed_count: int):
+        layout_map = {
+            1: {'rows': 1, 'columns': 1, 'slots': [(0, 0, 1, 1)]},
+            2: {'rows': 1, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1)]},
+            3: {'rows': 2, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 2)]},
+            4: {'rows': 2, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1)]},
+            5: {'rows': 3, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1), (2, 0, 1, 2)]},
+        }
+        if feed_count in layout_map:
+            return layout_map[feed_count]
+        # fallback: last defined layout (should not happen thanks to max limit)
+        return layout_map[max(layout_map.keys())]
+
+    def _calculate_tile_hints(self, rows: int, columns: int) -> tuple[int, int]:
+        viewport = self.video_area.viewport()
+        spacing_w = self.video_grid_layout.horizontalSpacing() or 0
+        spacing_h = self.video_grid_layout.verticalSpacing() or spacing_w
+        available_width = viewport.width() or self.video_area.width() or self._tile_max_width
+        available_height = viewport.height() or self.video_area.height() or int(self._tile_max_width / self._tile_aspect_ratio)
+        available_width = max(self._tile_min_width, available_width - spacing_w * max(0, columns - 1))
+        available_height = max(80, available_height - spacing_h * max(0, rows - 1))
+
+        column_width = max(120, available_width // max(1, columns))
+        row_height = max(90, available_height // max(1, rows))
+
+        base_width = min(self._tile_max_width, column_width)
+        width_from_height = int(row_height * self._tile_aspect_ratio)
+        if width_from_height > 0:
+            base_width = min(base_width, width_from_height)
+        base_width = max(self._tile_min_width, base_width)
+        base_height = max(90, int(base_width / self._tile_aspect_ratio))
+        return base_width, base_height
+
+    def eventFilter(self, obj, event):  # pragma: no cover - UI behavior
+        if obj == self.video_area.viewport() and event.type() == QEvent.Type.Resize:
+            self._reflow_video_tiles()
+        return super().eventFilter(obj, event)
+
+    def _set_active_feed(self, feed_id: int):
+        feed = self.feeds.get(feed_id)
+        if not feed:
+            return
+        if self.active_feed_id == feed_id:
+            return
+        if self.active_feed_id is not None and self.active_feed_id in self.feeds:
+            self.feeds[self.active_feed_id].video_label.set_active(False)
+        self.active_feed_id = feed_id
+        feed.video_label.set_active(True)
+        self._sync_active_feed_ui(feed)
+
+    def _sync_active_feed_ui(self, feed: FeedContext):
+        stats = feed.last_stats or {
+            'fps': 0.0,
+            'current_objects': 0,
+            'entries': 0,
+            'exits': 0,
+            'parking_objects': 0,
+            'parking_violations': 0,
+            'forbidden_objects': 0,
+            'unauthorized_zones': 0,
+            'alerts': 0
+        }
+        self._refresh_stats_panel(stats)
+        self._update_status_badge()
+        self._update_uptime(force=True)
+        self._sync_playback_controls_state(feed)
+        self._refresh_timeline_labels(feed)
+        self._update_controls_state()
+
+    def _refresh_stats_panel(self, stats: Dict):
+        self.fps_label.setText(f"{stats.get('fps', 0):.1f} FPS")
+        self.detected_label.setText(str(stats.get('current_objects', 0)))
+        self.entries_label.setText(str(stats.get('entries', 0)))
+        self.exits_label.setText(str(stats.get('exits', 0)))
+        parking_text = f"{stats.get('parking_objects', 0)} vehicules"
+        if stats.get('parking_violations'):
+            parking_text += f" | alertes: {stats['parking_violations']}"
+        self.parking_label.setText(parking_text)
+        forbidden_text = f"{stats.get('forbidden_objects', 0)} personnes"
+        if stats.get('unauthorized_zones'):
+            forbidden_text += f" | alertes: {stats['unauthorized_zones']}"
+        self.unauthorized_label.setText(forbidden_text)
+        self.alerts_count_label.setText(str(stats.get('alerts', 0)))
+
+    def _sync_playback_controls_state(self, feed: Optional[FeedContext]):
+        is_video = bool(feed and feed.is_video_source)
+        self.playback_group.setEnabled(is_video)
+        self.timeline_slider.setEnabled(is_video and bool(feed.thread))
+        if not is_video:
+            self.playback_position_label.setText("Lecture en direct")
+
+    def _refresh_timeline_labels(self, feed: FeedContext):
+        if feed.is_video_source and feed.last_frame_total > 0:
+            self.playback_position_label.setText(
+                self._format_position_text(feed.last_frame_index, feed.last_frame_total, feed.last_source_fps)
+            )
+        else:
+            self.playback_position_label.setText("Lecture en direct")
+
+    def _get_active_feed(self, required: bool = False) -> Optional[FeedContext]:
+        feed = self.feeds.get(self.active_feed_id) if self.active_feed_id is not None else None
+        if not feed and required:
+            QMessageBox.warning(self, "Flux requis", "Aucun flux n'est sélectionné dans cet onglet.")
+        return feed
+
+    def _add_additional_feed(self):
+        if len(self.feeds) >= self._max_feeds_per_tab:
+            QMessageBox.information(
+                self,
+                "Limite atteinte",
+                f"Vous pouvez afficher au maximum {self._max_feeds_per_tab} flux dans cet onglet."
+            )
+            return
+        dialog = SourceDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.source is not None:
+            self._create_feed(dialog.source, dialog.source_type)
+            self._update_status_badge()
+
+    def _sync_feed_limit_state(self):
+        if hasattr(self, 'add_feed_btn'):
+            can_add = len(self.feeds) < self._max_feeds_per_tab
+            self.add_feed_btn.setEnabled(can_add)
+            tooltip = "" if can_add else f"Limité à {self._max_feeds_per_tab} flux par onglet"
+            self.add_feed_btn.setToolTip(tooltip)
+
+    def _running_feed_count(self) -> int:
+        return sum(1 for feed in self.feeds.values() if feed.thread and feed.thread.isRunning())
+
+    def _update_status_badge(self):
+        total = len(self.feeds)
+        running = self._running_feed_count()
+        if running:
+            self.status_label.setText(f"🟢 Flux actifs: {running}/{total}")
+        else:
+            self.status_label.setText(f"[STOP] {total} flux prêts")
+            if self.update_timer.isActive():
+                self.update_timer.stop()
+                self._update_uptime(force=True)
+        self.start_btn.setEnabled(running < total or total == 0)
+        self.stop_btn.setEnabled(running > 0)
+
+    def _update_controls_state(self):
+        has_feed = self.active_feed_id is not None and self.active_feed_id in self.feeds
+        for widget in (self.zones_btn, self.preview_btn, self.alerts_btn):
+            widget.setEnabled(has_feed)
+        if not has_feed:
             self._reset_playback_controls()
     
     def start_camera(self):
-        """Start professional camera monitoring."""
-        if self.thread and self.thread.isRunning():
-            QMessageBox.warning(self, "En cours", "Cette caméra est déjà active")
+        """Start all stopped feeds within the tab."""
+        if not self.feeds:
+            QMessageBox.warning(self, "Flux manquant", "Ajoutez un flux avant de démarrer.")
             return
-        
-        try:
-            # Quick pre-check: attempt to open the source to fail fast for invalid videos
+
+        started_any = False
+        for feed in self.feeds.values():
+            if feed.thread and feed.thread.isRunning():
+                continue
             try:
-                test_cap = Camera(self.source)
+                test_cap = Camera(feed.source)
                 test_cap.release()
             except Exception as e:
-                QMessageBox.critical(self, "Erreur", f"Impossible d'ouvrir la source:\n{e}")
-                self.status_label.setText("🔴 Erreur")
-                return
+                QMessageBox.critical(self, "Erreur", f"Impossible d'ouvrir la source {feed.source}:\n{e}")
+                continue
 
-            self.status_label.setText("🟡 Démarrage...")
-            self.start_time = datetime.now()
-
-            # On démarre le worker vidéo avec les zones et le modèle sélectionné
-            self.thread = ProfessionalVideoThread(
-                camera_id=self.source,
-                zones_config=self.zones_config,
-                source_type=self.source_type,
+            thread = ProfessionalVideoThread(
+                feed_id=feed.feed_id,
+                camera_id=feed.source,
+                zones_config=feed.zones_config,
+                source_type=feed.source_type,
                 model_path=self._model_path
             )
-            
-            self.thread.frame_ready.connect(self._on_frame_ready)
-            self.thread.stats_ready.connect(self._on_stats_ready)
-            self.thread.alert_triggered.connect(self._on_alert)
-            self.thread.error_occurred.connect(self._on_thread_error)
-            
+            thread.frame_ready.connect(self._on_frame_ready)
+            thread.stats_ready.connect(self._on_stats_ready)
+            thread.alert_triggered.connect(self._on_alert)
+            thread.error_occurred.connect(self._on_thread_error)
+
             try:
-                self.thread.start()
+                thread.start()
             except Exception as e:
-                QMessageBox.critical(self, "Erreur", f"Impossible de démarrer la source:\n{e}")
-                self.status_label.setText("🔴 Erreur")
-                return
-            
-            # Activate zones rules after thread starts
-            self.thread.update_zones(self.zones_config)
-            self._apply_speed_setting()
+                QMessageBox.critical(self, "Erreur", f"Impossible de démarrer {feed.source}:\n{e}")
+                continue
+
+            feed.thread = thread
+            feed.start_time = datetime.now()
+            feed.pending_speed = self._pending_speed
+            feed.thread.update_zones(feed.zones_config)
+            if feed.is_video_source:
+                feed.thread.set_playback_speed(feed.pending_speed)
+                if feed.feed_id == self.active_feed_id:
+                    self.playback_position_label.setText("Chargement de la vidéo...")
+            started_any = True
+
+        if started_any:
             self._apply_overlay_settings()
             self._apply_advanced_settings()
-            
-            self.status_label.setText("🟢 Active")
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
-            self.zones_btn.setEnabled(True)
+            self._update_status_badge()
             self.update_timer.start(1000)
-            if self.is_video_source:
-                self.timeline_slider.setEnabled(True)
-                self.playback_position_label.setText("Chargement de la vidéo...")
-            
-        except Exception as e:
-            error_msg = f"Impossible de démarrer:\n{e}"
-            print(f"[App] {error_msg}")
-            QMessageBox.critical(self, "Erreur", error_msg)
-            self.status_label.setText("🔴 Erreur")
+            self._sync_playback_controls_state(self._get_active_feed())
+        else:
+            if any((not feed.thread) or (feed.thread and not feed.thread.isRunning()) for feed in self.feeds.values()):
+                QMessageBox.information(self, "Flux", "Aucun flux n'a pu être démarré.")
     
     def stop_camera(self):
         """Stop camera monitoring."""
-        if self.thread and self.thread.isRunning():
-            self.thread.stop()
+        stopped_any = False
+        for feed in self.feeds.values():
+            if feed.thread and feed.thread.isRunning():
+                feed.thread.stop()
+                feed.thread = None
+                stopped_any = True
+        if stopped_any:
             self.update_timer.stop()
-            self.status_label.setText("🔴 Arrêtée")
-            self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self._reset_playback_controls()
+            self._update_uptime(force=True)
+        self._update_status_badge()
     
     def preview_first_frame(self):
         """Preview first frame of source for zone editing."""
-        frame = get_first_frame(self.source)
+        feed = self._get_active_feed(required=True)
+        if not feed:
+            return
+        frame = get_first_frame(feed.source)
         if frame is None:
             QMessageBox.warning(self, "Erreur", "Impossible de lire la première frame")
             return
@@ -553,11 +871,11 @@ class ProfessionalCameraTab(QWidget):
         layout = QVBoxLayout()
         
         zone_editor = ZoneEditorWidget(initial_frame=frame)
-        zone_editor.zones = self.zones_config.copy()
+        zone_editor.zones = feed.zones_config.copy()
         zone_editor._update_display()
         
         def on_zones_done(zones):
-            self._on_zones_modified(zones)
+            self._on_zones_modified(feed.feed_id, zones)
             dialog.close()
         
         zone_editor.zones_modified.connect(on_zones_done)
@@ -567,6 +885,9 @@ class ProfessionalCameraTab(QWidget):
 
     def open_zone_editor(self):
         """Open zone editor - now works during video."""
+        feed = self._get_active_feed(required=True)
+        if not feed:
+            return
         dialog = QDialog(self)
         dialog.setWindowTitle("Éditeur de zones")
         dialog.setGeometry(100, 100, 1000, 700)
@@ -574,19 +895,19 @@ class ProfessionalCameraTab(QWidget):
         
         layout = QVBoxLayout()
         
-        if not self.thread or not self.thread.isRunning():
+        if not feed.thread or not feed.thread.isRunning():
             # Use preview button instead; this is now for live editing
             zone_editor = ZoneEditorWidget()
         else:
             dialog.setWindowTitle("Éditeur de zones (En direct)")
             zone_editor = ZoneEditorWidget(
-                get_frame_callback=self.thread.get_current_frame
+                get_frame_callback=feed.thread.get_current_frame
             )
-            zone_editor.zones = self.zones_config.copy()
+            zone_editor.zones = feed.zones_config.copy()
             zone_editor._update_display()
         
         def on_zones_done(zones):
-            self._on_zones_modified(zones)
+            self._on_zones_modified(feed.feed_id, zones)
             dialog.close()
         
         zone_editor.zones_modified.connect(on_zones_done)
@@ -602,50 +923,52 @@ class ProfessionalCameraTab(QWidget):
         self.alerts_window.raise_()
         self.alerts_window.activateWindow()
     
-    def _update_uptime(self):
-        """Update uptime display."""
-        if self.start_time:
-            elapsed = datetime.now() - self.start_time
+    def _update_uptime(self, force: bool = False):
+        """Update uptime display for the active feed."""
+        feed = self._get_active_feed()
+        if feed and feed.start_time:
+            elapsed = datetime.now() - feed.start_time
             hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
             minutes, seconds = divmod(remainder, 60)
             self.uptime_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        else:
+            if force or not feed:
+                self.uptime_label.setText("00:00:00")
     
-    def _on_zones_modified(self, zones: Dict):
-        """Zone configuration updated."""
-        self.zones_config = zones.copy()
-        ZonesManager.save_zones(zones, self.zone_profile_id)
-        if self.thread:
-            self.thread.update_zones(zones)
+    def _on_zones_modified(self, feed_id: int, zones: Dict):
+        """Zone configuration updated for a specific feed."""
+        feed = self.feeds.get(feed_id)
+        if not feed:
+            return
+        feed.zones_config = zones.copy()
+        ZonesManager.save_zones(zones, feed.zone_profile_id)
+        if feed.thread:
+            feed.thread.update_zones(zones)
     
-    def _on_frame_ready(self, image_bytes: bytes):
-        """Update video display from JPEG bytes."""
+    def _on_frame_ready(self, feed_id: int, image_bytes: bytes):
+        """Update video display for the matching feed."""
+        feed = self.feeds.get(feed_id)
+        if not feed:
+            return
         try:
-            pixmap = QPixmap()
-            pixmap.loadFromData(image_bytes)
-            scaled = pixmap.scaledToWidth(650, Qt.TransformationMode.SmoothTransformation)
-            self.video_label.setPixmap(scaled)
+            feed.video_label.update_frame(image_bytes)
         except Exception as e:
             print(f"[App] Error updating frame from bytes: {e}")
     
-    def _on_stats_ready(self, stats: Dict):
-        """Update statistics display."""
-        self.fps_label.setText(f"{stats['fps']:.1f} FPS")
-        self.detected_label.setText(str(stats['current_objects']))
-        self.entries_label.setText(str(stats['entries']))
-        self.exits_label.setText(str(stats['exits']))
-        parking_text = f"{stats['parking_objects']} vehicules"
-        if stats['parking_violations']:
-            parking_text += f" | alertes: {stats['parking_violations']}"
-        self.parking_label.setText(parking_text)
-
-        forbidden_text = f"{stats['forbidden_objects']} personnes"
-        if stats['unauthorized_zones']:
-            forbidden_text += f" | alertes: {stats['unauthorized_zones']}"
-        self.unauthorized_label.setText(forbidden_text)
-        self.alerts_count_label.setText(str(stats['alerts']))
-        self._update_playback_controls(stats)
+    def _on_stats_ready(self, feed_id: int, stats: Dict):
+        """Update statistics display for the matching feed."""
+        feed = self.feeds.get(feed_id)
+        if not feed:
+            return
+        feed.last_stats = stats
+        feed.last_frame_total = stats.get('frame_total') or 0
+        feed.last_frame_index = stats.get('frame_index') or 0
+        feed.last_source_fps = stats.get('source_fps') or 0.0
+        if feed_id == self.active_feed_id:
+            self._refresh_stats_panel(stats)
+            self._update_playback_controls(feed)
     
-    def _on_alert(self, alert_type: str, message: str):
+    def _on_alert(self, feed_id: int, alert_type: str, message: str):
         """Handle alert trigger."""
         track_id = 0
         try:
@@ -655,43 +978,50 @@ class ProfessionalCameraTab(QWidget):
             pass
         
         if self.alerts_window and self.alerts_window.isVisible():
-            self.alerts_window.add_alert(alert_type, message, self.camera_id, track_id)
+            camera_label = f"Tab {self.camera_id} | Flux {feed_id}"
+            self.alerts_window.add_alert(alert_type, message, camera_label, track_id)
     
-    def _on_thread_error(self, error_msg: str):
-        """Handle thread error."""
-        print(f"[App] Thread error: {error_msg}")
-        QMessageBox.critical(self, "Erreur du fil d'exécution", error_msg)
-        self.status_label.setText("🔴 Erreur")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+    def _on_thread_error(self, feed_id: int, error_msg: str):
+        """Handle thread error for a specific feed."""
+        print(f"[App] Thread error (feed {feed_id}): {error_msg}")
+        QMessageBox.critical(self, "Erreur du fil d'exécution", f"Flux {feed_id}: {error_msg}")
+        feed = self.feeds.get(feed_id)
+        if feed and feed.thread:
+            feed.thread = None
+        self._update_status_badge()
     
     def _on_accuracy_changed(self, value: int):
         """Update accuracy."""
-        if self.thread:
-            self.thread.set_accuracy(value / 100.0)
+        for feed in self.feeds.values():
+            if feed.thread:
+                feed.thread.set_accuracy(value / 100.0)
     
     def _on_show_accuracy_changed(self, state):
         """Update show accuracy."""
-        if self.thread:
-            self.thread.set_show_accuracy(self.show_accuracy_check.isChecked())
+        for feed in self.feeds.values():
+            if feed.thread:
+                feed.thread.set_show_accuracy(self.show_accuracy_check.isChecked())
 
     def _apply_overlay_settings(self):
         """Apply overlay toggles to the worker thread."""
-        if not self.thread:
-            return
-        self.thread.set_show_boxes(self.show_boxes_check.isChecked())
-        self.thread.set_show_labels(self.show_labels_check.isChecked())
-        self.thread.set_show_zones(self.show_zones_check.isChecked())
-        self.thread.set_show_centers(self.show_centers_check.isChecked())
+        for feed in self.feeds.values():
+            if not feed.thread:
+                continue
+            feed.thread.set_show_boxes(self.show_boxes_check.isChecked())
+            feed.thread.set_show_labels(self.show_labels_check.isChecked())
+            feed.thread.set_show_zones(self.show_zones_check.isChecked())
+            feed.thread.set_show_centers(self.show_centers_check.isChecked())
 
     def _apply_advanced_settings(self):
         """Push advanced display settings to the worker thread."""
         info_states = self._get_info_field_states()
         self._info_panel_defaults.update(info_states)
-        if self.thread:
-            self.thread.set_info_panel_visibility(self.show_info_panel_check.isChecked())
-            self.thread.set_info_panel_fields(info_states)
-            self.thread.set_hidden_classes(list(self._hidden_classes))
+        for feed in self.feeds.values():
+            if not feed.thread:
+                continue
+            feed.thread.set_info_panel_visibility(self.show_info_panel_check.isChecked())
+            feed.thread.set_info_panel_fields(info_states)
+            feed.thread.set_hidden_classes(list(self._hidden_classes))
 
     def _get_info_field_states(self):
         states = {}
@@ -710,8 +1040,9 @@ class ProfessionalCameraTab(QWidget):
 
     def _apply_hidden_classes(self):
         self._hidden_classes = self._get_hidden_classes()
-        if self.thread:
-            self.thread.set_hidden_classes(list(self._hidden_classes))
+        for feed in self.feeds.values():
+            if feed.thread:
+                feed.thread.set_hidden_classes(list(self._hidden_classes))
 
     def _get_hidden_classes(self):
         text = self.hidden_classes_input.text() if hasattr(self, 'hidden_classes_input') else ""
@@ -743,11 +1074,12 @@ class ProfessionalCameraTab(QWidget):
         if not path.lower().endswith(".pt"):
             QMessageBox.warning(self, "Modèle incompatible", "Seuls les poids YOLOv8 au format .pt sont pris en charge.")
             return
-        # Mémoriser le chemin et prévenir le thread vidéo pour qu'il recharge YOLO
+        # Mémoriser le chemin et prévenir chaque thread vidéo
         self._model_path = path
         self._refresh_model_status_label()
-        if self.thread:
-            self.thread.set_model_path(self._model_path)
+        for feed in self.feeds.values():
+            if feed.thread:
+                feed.thread.set_model_path(self._model_path)
 
     def _refresh_model_status_label(self):
         if hasattr(self, 'model_status_label'):
@@ -773,8 +1105,11 @@ class ProfessionalCameraTab(QWidget):
         if speed is None:
             speed = 1.0
         self._pending_speed = float(speed)
-        if self.is_video_source and self.thread:
-            self.thread.set_playback_speed(self._pending_speed)
+        feed = self._get_active_feed()
+        if feed and feed.is_video_source:
+            feed.pending_speed = self._pending_speed
+            if feed.thread:
+                feed.thread.set_playback_speed(feed.pending_speed)
 
     def _on_speed_changed(self, _index: int):
         """Handle speed combo change."""
@@ -783,26 +1118,32 @@ class ProfessionalCameraTab(QWidget):
     def _on_seek_pressed(self):
         """Mark slider as user-controlled."""
         self._slider_active = True
+        self._slider_active_feed_id = self.active_feed_id
 
     def _on_seek_value_changed(self, value: int):
         """Update preview label while dragging."""
-        if not (self.is_video_source and self._slider_active and self._last_frame_total > 0):
+        if not self._slider_active:
+            return
+        feed = self.feeds.get(self._slider_active_feed_id or -1)
+        if not feed or not feed.is_video_source or feed.last_frame_total <= 0:
             return
         progress = value / max(1, self.timeline_slider.maximum())
-        target_frame = int(progress * max(1, self._last_frame_total - 1))
+        target_frame = int(progress * max(1, feed.last_frame_total - 1))
         self.playback_position_label.setText(
-            self._format_position_text(target_frame, self._last_frame_total, self._last_source_fps)
+            self._format_position_text(target_frame, feed.last_frame_total, feed.last_source_fps)
         )
 
     def _on_seek_released(self):
         """Seek to selected position when slider released."""
-        if not self.is_video_source:
+        feed = self._get_active_feed()
+        if not feed or not feed.is_video_source:
             self._slider_active = False
             return
         progress = self.timeline_slider.value() / max(1, self.timeline_slider.maximum())
-        if self.thread and self.thread.isRunning():
-            self.thread.seek_to_progress(progress)
+        if feed.thread and feed.thread.isRunning():
+            feed.thread.seek_to_progress(progress)
         self._slider_active = False
+        self._slider_active_feed_id = None
 
     def _format_time(self, seconds: float) -> str:
         seconds = max(0, int(seconds))
@@ -821,16 +1162,16 @@ class ProfessionalCameraTab(QWidget):
             return f"Frame {frame_index}/{frame_total}"
         return "Lecture en direct"
 
-    def _update_playback_controls(self, stats: Dict):
-        """Synchronize slider/labels with backend stats."""
-        if not self.is_video_source:
+    def _update_playback_controls(self, feed: FeedContext):
+        """Synchronize slider/labels with backend stats of the active feed."""
+        if not feed.is_video_source:
+            self.timeline_slider.setEnabled(False)
+            self.playback_position_label.setText("Lecture en direct")
             return
-        frame_total = stats.get('frame_total') or 0
-        frame_index = stats.get('frame_index') or 0
-        source_fps = stats.get('source_fps') or 0
-        self._last_frame_total = frame_total
-        self._last_frame_index = frame_index
-        self._last_source_fps = source_fps
+
+        frame_total = feed.last_frame_total
+        frame_index = feed.last_frame_index
+        source_fps = feed.last_source_fps
 
         if frame_total <= 0:
             self.timeline_slider.setEnabled(False)
@@ -851,23 +1192,24 @@ class ProfessionalCameraTab(QWidget):
 
     def _reset_playback_controls(self):
         """Reset slider/labels when playback stops."""
-        if not self.is_video_source or not hasattr(self, 'timeline_slider'):
+        if not hasattr(self, 'timeline_slider'):
             return
         self.timeline_slider.blockSignals(True)
         self.timeline_slider.setValue(0)
         self.timeline_slider.blockSignals(False)
         self.timeline_slider.setEnabled(False)
         self.playback_position_label.setText("Lecture en direct")
-        self._last_frame_total = 0
-        self._last_frame_index = 0
         self._slider_active = False
+        self._slider_active_feed_id = None
         # Keep last selected speed so it re-applies on next start
     
     def cleanup(self):
         """Cleanup."""
         self.update_timer.stop()
-        if self.thread and self.thread.isRunning():
-            self.thread.stop()
+        for feed in self.feeds.values():
+            if feed.thread and feed.thread.isRunning():
+                feed.thread.stop()
+                feed.thread = None
         self._reset_playback_controls()
         if self.alerts_window:
             self.alerts_window.close()
@@ -956,15 +1298,15 @@ class ProfessionalApp(QWidget):
             tab = self.tab_widget.widget(index)
             if isinstance(tab, ProfessionalCameraTab):
                 tab.cleanup()
+                self.camera_tabs.pop(tab.camera_id, None)
             self.tab_widget.removeTab(index)
             self._update_info()
     
     def _update_info(self):
         """Update info label."""
-        active = sum(1 for tab in self.camera_tabs.values() 
-                     if tab.thread and tab.thread.isRunning())
-        total = len(self.camera_tabs)
-        self.info_label.setText(f"Caméras: {total} | Actives: {active}")
+        active_feeds = sum(tab._running_feed_count() for tab in self.camera_tabs.values())
+        total_tabs = len(self.camera_tabs)
+        self.info_label.setText(f"Onglets: {total_tabs} | Flux actifs: {active_feeds}")
 
 
 def main():

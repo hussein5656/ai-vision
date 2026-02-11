@@ -20,14 +20,15 @@ from logic.engine import LogicEngine
 class ProfessionalVideoThread(QThread):
     """Worker thread for professional video processing."""
     
-    frame_ready = pyqtSignal(bytes)
-    stats_ready = pyqtSignal(dict)
-    alert_triggered = pyqtSignal(str, str)
-    error_occurred = pyqtSignal(str)
+    frame_ready = pyqtSignal(int, bytes)
+    stats_ready = pyqtSignal(int, dict)
+    alert_triggered = pyqtSignal(int, str, str)
+    error_occurred = pyqtSignal(int, str)
     
-    def __init__(self, camera_id, zones_config: Dict = None, source_type: int = 0,
+    def __init__(self, feed_id: int, camera_id, zones_config: Dict = None, source_type: int = 0,
                  model_path: str = "yolov8n.pt"):
         super().__init__()
+        self.feed_id = feed_id
         self.camera_id = camera_id
         self.zones_config = zones_config or {}
         self.source_type = source_type
@@ -101,7 +102,7 @@ class ProfessionalVideoThread(QThread):
         except Exception as e:
             error_msg = f"Camera error: {e}"
             print(f"[VideoThread] {error_msg}")
-            self.error_occurred.emit(error_msg)
+            self.error_occurred.emit(self.feed_id, error_msg)
             self.camera = None
     
     def run(self):
@@ -242,7 +243,7 @@ class ProfessionalVideoThread(QThread):
                     pass
                 # Emit abbreviated error message for UI
                 short_msg = f"Processing error: {type(e).__name__}: {e}"
-                self.error_occurred.emit(short_msg)
+                self.error_occurred.emit(self.feed_id, short_msg)
                 break
     
     def _draw_professional_viz(self, frame, tracks):
@@ -523,7 +524,7 @@ class ProfessionalVideoThread(QThread):
 
             # Emit alert
             try:
-                self.alert_triggered.emit(alert_type, msg)
+                self.alert_triggered.emit(self.feed_id, alert_type, msg)
             except Exception:
                 pass
     
@@ -544,7 +545,7 @@ class ProfessionalVideoThread(QThread):
             if not ret:
                 return
             data = buf.tobytes()
-            self.frame_ready.emit(data)
+            self.frame_ready.emit(self.feed_id, data)
         except Exception as e:
             print(f"[VideoThread] Error emitting frame: {e}")
     
@@ -564,7 +565,7 @@ class ProfessionalVideoThread(QThread):
             'frame_total': self.frame_total,
             'source_fps': self.source_fps
         }
-        self.stats_ready.emit(stats)
+        self.stats_ready.emit(self.feed_id, stats)
     
     def get_current_frame(self):
         """Get current frame for zone editor."""
@@ -798,7 +799,7 @@ class ProfessionalVideoThread(QThread):
         try:
             new_detector = Detector(model_path=model_path, conf=self._confidence)
         except Exception as e:
-            self.error_occurred.emit(f"Modèle indisponible ({model_path}): {e}")
+            self.error_occurred.emit(self.feed_id, f"Modèle indisponible ({model_path}): {e}")
             return
         # Remplacer l'ancien détecteur par le nouveau en douceur
         old_detector = self.detector

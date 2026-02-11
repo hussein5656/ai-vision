@@ -1,8 +1,12 @@
+import os
 import time
+import platform
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse, urljoin
+from typing import Optional, Any, List
+
 import cv2
 import numpy as np
-from typing import Optional, Any, List
 
 try:
     import requests
@@ -153,7 +157,7 @@ class Camera:
         source = "video.mp4" → fichier vidéo
         source = "http://IP:PORT/video" → caméra IP
         """
-        self.source = source
+        self.source = self._normalize_source(source)
         self.cap = None
         self.http_stream: Optional[HTTPStreamReader] = None
         self._pending_http_frame = None
@@ -338,23 +342,13 @@ class Camera:
         return latest
 
     def _open_capture(self, source):
-        """Try multiple OpenCV backends for remote streams."""
-        backends = [None]
+        """Try multiple OpenCV backends depending on the platform and source type."""
         is_remote = isinstance(source, str) and source.lower().startswith(REMOTE_PREFIXES)
-        if is_remote:
-            ffmpeg_backend = getattr(cv2, "CAP_FFMPEG", None)
-            gst_backend = getattr(cv2, "CAP_GSTREAMER", None)
-            if ffmpeg_backend is not None:
-                backends.append(ffmpeg_backend)
-            if gst_backend is not None and gst_backend != ffmpeg_backend:
-                backends.append(gst_backend)
+        backend_candidates = self._build_backend_priority(is_remote)
 
-        for backend in backends:
+        for backend in backend_candidates:
             try:
-                if backend is None:
-                    cap = cv2.VideoCapture(source)
-                else:
-                    cap = cv2.VideoCapture(source, backend)
+                cap = cv2.VideoCapture(source) if backend is None else cv2.VideoCapture(source, backend)
             except Exception:
                 continue
 
@@ -372,3 +366,50 @@ class Camera:
                 pass
 
         return None
+
+    def _build_backend_priority(self, is_remote: bool):
+        """Return a deduplicated list of backend constants to try."""
+        order: List[Optional[int]] = [None]
+        if is_remote:
+            for name in ("CAP_FFMPEG", "CAP_GSTREAMER"):
+                backend = getattr(cv2, name, None)
+                if backend is not None:
+                    order.append(backend)
+        else:
+            order.extend(self._local_backend_candidates())
+
+        seen = set()
+        deduped: List[Optional[int]] = []
+        for backend in order:
+            key = backend if backend is not None else "default"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(backend)
+        return deduped
+
+    def _local_backend_candidates(self) -> List[int]:
+        system = platform.system().lower()
+        order: List[str] = []
+        if system == "windows":
+            order = ["CAP_DSHOW", "CAP_MSMF"]
+        elif system == "darwin":
+            order = ["CAP_AVFOUNDATION"]
+        elif system == "linux":
+            order = ["CAP_V4L2", "CAP_ANY"]
+        else:
+            order = ["CAP_ANY"]
+
+        backends: List[int] = []
+        for name in order:
+            backend = getattr(cv2, name, None)
+            if backend is not None:
+                backends.append(backend)
+        return backends
+
+    def _normalize_source(self, source):
+        if isinstance(source, Path):
+            source = str(source)
+        if isinstance(source, str):
+            return os.path.expanduser(source)
+        return source
