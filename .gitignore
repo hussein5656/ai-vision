@@ -1,0 +1,22 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+.env/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Local data and logs
+app_errors.log
+zones.json
+*.db
+
+# Large model weights
+models/*.pt
+models/*.onnx
