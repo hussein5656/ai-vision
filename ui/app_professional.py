@@ -2,6 +2,8 @@
 
 import sys
 import os
+import math
+import time
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QEvent, QSize
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTabWidget, QSpinBox,
@@ -113,6 +115,8 @@ class FeedContext:
     last_source_fps: float = 0.0
     pending_speed: float = 1.0
     start_time: Optional[datetime] = None
+    last_ui_frame_time: float = 0.0
+    processing_mode: str = "background"
 
     @property
     def is_video_source(self) -> bool:
@@ -266,10 +270,22 @@ class ProfessionalCameraTab(QWidget):
             'parking': True,
             'forbidden': True
         }
-        self._tile_min_width = 160
+        self._tile_min_width = 140
         self._tile_max_width = 640
         self._tile_aspect_ratio = 16 / 9
-        self._max_feeds_per_tab = 5
+        self._max_feeds_per_tab: Optional[int] = None
+        self._max_grid_columns = 4
+        self._layout_presets = {
+            1: {'rows': 1, 'columns': 1, 'slots': [(0, 0, 1, 1)]},
+            2: {'rows': 1, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1)]},
+            3: {'rows': 2, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 2)]},
+            4: {'rows': 2, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1)]},
+            5: {'rows': 3, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1), (2, 0, 1, 2)]},
+        }
+        self._last_layout_rows = 0
+        self._last_layout_cols = 0
+        self._active_frame_interval = 1.0 / 24.0
+        self._background_frame_interval = 1.0 / 8.0
         # Liste de modèles compatibles proposée à l'utilisateur
         self._available_models = [
             ("YOLOv8n (rapide)", "models/yolov8n.pt"),
@@ -598,6 +614,7 @@ class ProfessionalCameraTab(QWidget):
         else:
             tile.set_active(False)
             self._update_status_badge()
+            context.processing_mode = "background"
 
     def _reflow_video_tiles(self):
         count = self.video_grid_layout.count()
@@ -618,9 +635,9 @@ class ProfessionalCameraTab(QWidget):
         layout_def = self._build_layout_blueprint(len(feed_items))
         base_width, base_height = self._calculate_tile_hints(layout_def['rows'], layout_def['columns'])
 
-        for row in range(0, 5):
+        for row in range(self._last_layout_rows):
             self.video_grid_layout.setRowStretch(row, 0)
-        for col in range(0, 5):
+        for col in range(self._last_layout_cols):
             self.video_grid_layout.setColumnStretch(col, 0)
 
         for row in range(layout_def['rows']):
@@ -635,18 +652,24 @@ class ProfessionalCameraTab(QWidget):
             feed.video_label.resize_tile(pref_width, pref_height)
             self.video_grid_layout.addWidget(feed.video_label, row, col, row_span, col_span)
 
+        self._last_layout_rows = layout_def['rows']
+        self._last_layout_cols = layout_def['columns']
+
     def _build_layout_blueprint(self, feed_count: int):
-        layout_map = {
-            1: {'rows': 1, 'columns': 1, 'slots': [(0, 0, 1, 1)]},
-            2: {'rows': 1, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1)]},
-            3: {'rows': 2, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 2)]},
-            4: {'rows': 2, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1)]},
-            5: {'rows': 3, 'columns': 2, 'slots': [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1), (2, 0, 1, 2)]},
-        }
-        if feed_count in layout_map:
-            return layout_map[feed_count]
-        # fallback: last defined layout (should not happen thanks to max limit)
-        return layout_map[max(layout_map.keys())]
+        preset = self._layout_presets.get(feed_count)
+        if preset:
+            return preset
+        columns = max(1, min(self._max_grid_columns, int(math.ceil(math.sqrt(feed_count)))))
+        rows = max(1, int(math.ceil(feed_count / columns)))
+        slots = []
+        idx = 0
+        for row in range(rows):
+            for col in range(columns):
+                if idx >= feed_count:
+                    break
+                slots.append((row, col, 1, 1))
+                idx += 1
+        return {'rows': rows, 'columns': columns, 'slots': slots}
 
     def _calculate_tile_hints(self, rows: int, columns: int) -> tuple[int, int]:
         viewport = self.video_area.viewport()
@@ -684,6 +707,7 @@ class ProfessionalCameraTab(QWidget):
         self.active_feed_id = feed_id
         feed.video_label.set_active(True)
         self._sync_active_feed_ui(feed)
+        self._apply_processing_modes()
 
     def _sync_active_feed_ui(self, feed: FeedContext):
         stats = feed.last_stats or {
@@ -741,7 +765,7 @@ class ProfessionalCameraTab(QWidget):
         return feed
 
     def _add_additional_feed(self):
-        if len(self.feeds) >= self._max_feeds_per_tab:
+        if self._max_feeds_per_tab is not None and len(self.feeds) >= self._max_feeds_per_tab:
             QMessageBox.information(
                 self,
                 "Limite atteinte",
@@ -752,13 +776,25 @@ class ProfessionalCameraTab(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.source is not None:
             self._create_feed(dialog.source, dialog.source_type)
             self._update_status_badge()
+            self._apply_processing_modes()
 
     def _sync_feed_limit_state(self):
         if hasattr(self, 'add_feed_btn'):
-            can_add = len(self.feeds) < self._max_feeds_per_tab
-            self.add_feed_btn.setEnabled(can_add)
-            tooltip = "" if can_add else f"Limité à {self._max_feeds_per_tab} flux par onglet"
+            if self._max_feeds_per_tab is None:
+                self.add_feed_btn.setEnabled(True)
+                tooltip = ""
+            else:
+                can_add = len(self.feeds) < self._max_feeds_per_tab
+                self.add_feed_btn.setEnabled(can_add)
+                tooltip = "" if can_add else f"Limité à {self._max_feeds_per_tab} flux par onglet"
             self.add_feed_btn.setToolTip(tooltip)
+
+    def _apply_processing_modes(self):
+        for feed_id, feed in self.feeds.items():
+            target_mode = "active" if feed_id == self.active_feed_id else "background"
+            feed.processing_mode = target_mode
+            if feed.thread:
+                feed.thread.set_processing_priority(target_mode)
 
     def _running_feed_count(self) -> int:
         return sum(1 for feed in self.feeds.values() if feed.thread and feed.thread.isRunning())
@@ -822,6 +858,7 @@ class ProfessionalCameraTab(QWidget):
             feed.start_time = datetime.now()
             feed.pending_speed = self._pending_speed
             feed.thread.update_zones(feed.zones_config)
+            feed.thread.set_processing_priority(feed.processing_mode)
             if feed.is_video_source:
                 feed.thread.set_playback_speed(feed.pending_speed)
                 if feed.feed_id == self.active_feed_id:
@@ -834,6 +871,7 @@ class ProfessionalCameraTab(QWidget):
             self._update_status_badge()
             self.update_timer.start(1000)
             self._sync_playback_controls_state(self._get_active_feed())
+            self._apply_processing_modes()
         else:
             if any((not feed.thread) or (feed.thread and not feed.thread.isRunning()) for feed in self.feeds.values()):
                 QMessageBox.information(self, "Flux", "Aucun flux n'a pu être démarré.")
@@ -950,6 +988,11 @@ class ProfessionalCameraTab(QWidget):
         feed = self.feeds.get(feed_id)
         if not feed:
             return
+        now = time.monotonic()
+        interval = self._active_frame_interval if feed_id == self.active_feed_id else self._background_frame_interval
+        if interval > 0 and (now - feed.last_ui_frame_time) < interval:
+            return
+        feed.last_ui_frame_time = now
         try:
             feed.video_label.update_frame(image_bytes)
         except Exception as e:
@@ -1070,6 +1113,10 @@ class ProfessionalCameraTab(QWidget):
         else:
             path = selected or self._model_path
         if not path:
+            return
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Modèle introuvable", f"Le fichier suivant est inaccessible:\n{path}")
             return
         if not path.lower().endswith(".pt"):
             QMessageBox.warning(self, "Modèle incompatible", "Seuls les poids YOLOv8 au format .pt sont pris en charge.")

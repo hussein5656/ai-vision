@@ -3,6 +3,7 @@
 import cv2
 import numpy as np
 from typing import Optional, List, Dict, Any
+import os
 
 # COCO class names (80 classes)
 COCO_CLASS_NAMES = [
@@ -47,9 +48,10 @@ def is_vehicle_class(class_id: Optional[int]) -> bool:
 class Detector:
     """Detector using YOLO client for detection and YOLO's native tracking."""
     
-    def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.4):
+    def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.4, max_side: Optional[int] = None):
         self.conf = conf
-        self.model_path = model_path
+        self.model_path = os.path.abspath(os.path.expanduser(model_path or "yolov8n.pt"))
+        self.max_side = max_side
         self.yolo_client = None
         self.bg_sub = None
         self._init_yolo_client()
@@ -77,13 +79,18 @@ class Detector:
             except Exception:
                 self.bg_sub = None
     
-    def detect(self, frame, count_classes=None, conf=None, **kwargs) -> List[Dict[str, Any]]:
+    def detect(self, frame, count_classes=None, conf=None, max_side: Optional[int] = None, **kwargs) -> List[Dict[str, Any]]:
         """
         Detect objects in frame. Returns list with track_id, class, bbox, center, confidence.
         
         Uses YOLO's native tracking if available, else motion detection.
         YOLO already provides track_id via persist=True, so we don't need additional tracking.
         """
+        resize_meta = None
+        target_side = max_side or self.max_side
+        if target_side:
+            resize_meta, frame = self._resize_for_detection(frame, target_side)
+
         # Prefer YOLO (which has native tracking)
         if self.yolo_client and self.yolo_client.is_ready():
             try:
@@ -91,6 +98,8 @@ class Detector:
                 # Filter by class if specified
                 if count_classes is not None and detections:
                     detections = [d for d in detections if d.get('class', 0) in count_classes]
+                if resize_meta:
+                    detections = self._rescale_detections(detections, resize_meta)
                 return detections
             except Exception as e:
                 print(f"[Detector] YOLO error: {e}")
@@ -133,3 +142,43 @@ class Detector:
         """Cleanup resources."""
         if self.yolo_client:
             self.yolo_client.shutdown()
+
+    def set_max_side(self, value: Optional[int]):
+        self.max_side = value
+
+    def _resize_for_detection(self, frame, target_side: int):
+        if frame is None:
+            return None, frame
+        h, w = frame.shape[:2]
+        max_dim = max(h, w)
+        if max_dim <= target_side:
+            return None, frame
+        scale = target_side / float(max_dim)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        return {'scale_x': w / float(new_w), 'scale_y': h / float(new_h)}, resized
+
+    def _rescale_detections(self, detections: List[Dict[str, Any]], meta: Dict[str, float]):
+        scale_x = meta.get('scale_x', 1.0)
+        scale_y = meta.get('scale_y', 1.0)
+        if not detections or (scale_x == 1.0 and scale_y == 1.0):
+            return detections
+        for det in detections:
+            bbox = det.get('bbox')
+            if bbox and len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                det['bbox'] = (
+                    int(round(x1 * scale_x)),
+                    int(round(y1 * scale_y)),
+                    int(round(x2 * scale_x)),
+                    int(round(y2 * scale_y))
+                )
+            center = det.get('center')
+            if center and len(center) == 2:
+                cx, cy = center
+                det['center'] = (
+                    int(round(cx * scale_x)),
+                    int(round(cy * scale_y))
+                )
+        return detections

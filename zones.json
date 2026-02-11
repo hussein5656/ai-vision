@@ -104,6 +104,13 @@
       "parking_zones": [],
       "loitering_zones": [],
       "restricted_areas": []
+    },
+    "C:/itlocal/examin_finale_ia/video3.mp4": {
+      "counting_lines": [],
+      "forbidden_zones": [],
+      "parking_zones": [],
+      "loitering_zones": [],
+      "restricted_areas": []
     }
   }
 }

@@ -89,6 +89,17 @@ class ProfessionalVideoThread(QThread):
             'forbidden': True
         }
         self._cache_polygons()
+        self._processing_mode = "background"
+        self._active_max_side = 960
+        self._background_max_side = 640
+        self._current_max_side = self._active_max_side
+        self._active_stride = 1
+        self._background_stride = 2
+        self._processing_stride = 1
+        self._frame_cycle = 0
+        self._jpeg_quality_active = 80
+        self._jpeg_quality_background = 60
+        self._current_jpeg_quality = self._jpeg_quality_active
     
     def _setup_camera(self):
         """Setup camera."""
@@ -141,6 +152,15 @@ class ProfessionalVideoThread(QThread):
                 if frame is None:
                     time.sleep(0.01)
                     continue
+
+                self._frame_cycle += 1
+                self._lock.lock()
+                stride = self._processing_stride
+                max_side = self._current_max_side
+                jpeg_quality = self._current_jpeg_quality
+                self._lock.unlock()
+                if stride > 1 and (self._frame_cycle % stride) != 0:
+                    continue
                 
                 # Skip frames for live cameras, process all for videos
                 is_video = isinstance(self.camera_id, str)
@@ -163,7 +183,7 @@ class ProfessionalVideoThread(QThread):
                         continue
                 
                 # Detection (YOLO provides native tracking via track_id)
-                tracks = self.detector.detect(frame, conf=conf) if self.detector else []
+                tracks = self.detector.detect(frame, conf=conf, max_side=max_side) if self.detector else []
                 self.current_detections = len(tracks)
                 self._update_zone_presence(tracks)
                 if self.is_video_source:
@@ -189,7 +209,7 @@ class ProfessionalVideoThread(QThread):
                 # Convert and emit
                 self.frame_count += 1
                 self._update_fps()
-                self._emit_frame(vis_frame)
+                self._emit_frame(vis_frame, jpeg_quality)
 
                 # Throttle to video FPS for smooth, real-time-like playback
                 if not self.is_remote_http_source:
@@ -391,6 +411,15 @@ class ProfessionalVideoThread(QThread):
                 cached[key].append(self._normalize_polygon(zone))
         self._cached_polygons = cached
 
+    def set_processing_priority(self, mode: str):
+        target = "active" if mode == "active" else "background"
+        self._lock.lock()
+        self._processing_mode = target
+        self._processing_stride = self._active_stride if target == "active" else self._background_stride
+        self._current_max_side = self._active_max_side if target == "active" else self._background_max_side
+        self._current_jpeg_quality = self._jpeg_quality_active if target == "active" else self._jpeg_quality_background
+        self._lock.unlock()
+
     def _point_in_polygon(self, polygon, x, y) -> bool:
         if polygon is None:
             return False
@@ -537,11 +566,11 @@ class ProfessionalVideoThread(QThread):
             self.total_fps = (self.total_fps * 0.8 + self.fps_counter * 0.2)
         self.last_frame_time = current_time
     
-    def _emit_frame(self, frame):
+    def _emit_frame(self, frame, jpeg_quality: int):
         """Convert OpenCV frame to QImage and emit."""
         try:
-            # Encode frame as JPEG bytes to avoid sharing numpy memory across threads
-            ret, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            quality = max(30, min(95, jpeg_quality))
+            ret, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
             if not ret:
                 return
             data = buf.tobytes()

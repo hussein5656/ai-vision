@@ -18,7 +18,7 @@ class YOLOClient:
     """Client for communicating with YOLO server subprocess."""
 
     def __init__(self, model_path: str = "yolov8n.pt", timeout: int = 5):
-        self.model_path = model_path
+        self.model_path = os.path.abspath(os.path.expanduser(model_path)) if model_path else "yolov8n.pt"
         self.timeout = timeout
         self.process: Optional[subprocess.Popen] = None
         self.lock = threading.Lock()
